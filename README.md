@@ -1,79 +1,35 @@
-# Personal Telegram Update Bot (Starter Project)
+# Jeni26 Telegram Bot — Updated
 
-A Telegram bot starter with:
-- Required channel subscription check (one or multiple channels)
-- User database for people who have started the bot
-- Main menu with update list, YouTube, Instagram, official channel, support links
-- Dynamic download updates (add/hide from Telegram with commands)
-- Dynamic URL buttons
-- Owner-only Telegram admin panel
-- Manual channel-post/file-to-DM broadcast to users who previously started the bot
-- Statistics, admin logs, maintenance mode
-- SQLite database backups, scheduled backups, and a backup file sent to owner chat
-- Dockerfile for deployment
+This package preserves the uploaded `main.py` bot's existing start flow, force-subscribe Join/Verify buttons, update/download menu, custom URL buttons, owner panel, SQLite user tracking, broadcast, logs, maintenance mode, and scheduled/manual database backups, while adding the features listed below.
 
-## Important Telegram limitations
-1. Telegram bots cannot automatically add users to a channel. Users must join themselves.
-2. A bot cannot DM arbitrary channel subscribers. It can message only users who have initiated the bot, and only while Telegram allows it.
-3. Channel members are not automatically bot users. This bot's broadcast target is its saved user database.
-4. The bot must be an administrator in each required channel to check membership, and in the official channel to receive channel posts.
-5. Manual broadcast is intentionally used by default; there is no automatic DM blast on every channel post.
-6. Test in a private/small test group first. Telegram rate limits and blocked users affect delivery.
+## Added features
+- Database backup restore: owner sends a `.sqlite3`, `.sqlite`, or `.db` backup in the bot's private chat with caption `/restore`. Use `/restorehelp` for instructions. Restore overwrites the current database; take a backup first.
+- Feedback album: `/setfeedbackchannel @channel`, `/feedback_album`, send up to 10 photos, `/feedback_done`, then send the caption. Bot posts the album and tracks its message IDs.
+- Tracked-post cleanup: `/cleanup_posts @channel` deletes only bot-created feedback albums tracked in this database, not all channel history.
+- Group welcome message: `/setwelcome Welcome {name}! Please read the rules.`
+- Group moderation: anti-link, custom profanity word list, basic adult-content keyword filter, warning tracking, 1-day ban on second violation, 7-day ban on third, permanent ban on a later violation.
+- Moderation controls: `/modsettings`, `/antilink_on`, `/antilink_off`, `/profanity_on`, `/profanity_off`, `/adultfilter_on`, `/adultfilter_off`, `/setprofanity word1,word2`, `/setallowedlinks t.me/,example.com`.
+- Warning tools: `/warnings` and reply to a user's message with `/resetwarnings`.
+- Support tickets: `/ticket your issue`; owner can reply with `/ticketreply TICKET_ID your reply`.
+- Admin panel has added help buttons for moderation, feedback albums, and tracked-post cleanup.
 
-## Setup
-1. Create a bot with Telegram's official `@BotFather` and copy its token.
-2. Copy `.env.example` to `.env`.
-3. Set `BOT_TOKEN`, `OWNER_ID`, `OFFICIAL_CHANNEL`, `OFFICIAL_CHANNEL_URL`, and `REQUIRED_CHANNELS`.
-4. Add the bot as an administrator in the required channel(s), with permission to view members; add it as an administrator in the official channel to receive channel posts.
-5. Install Python 3.11+ (3.12 recommended), then run:
+## Important limitations and permissions
+- The same Telegram bot token means the bot identity stays the same when moving hosting. If the old SQLite backup is restored, saved users and their data return; they do not need to send `/start` again just because hosting changed. Broadcasts can reach saved users who previously started the bot and have not blocked it. Users who are only channel subscribers but never started the bot are not in the bot user database and cannot be DM'd by the bot.
+- If you use a different bot token/new bot account, users must start that new bot themselves; the old bot's chat cannot be transferred.
+- Add the bot as admin in the target group with Delete Messages and Ban Users permissions for moderation. Add it as admin in the feedback channel to post albums and delete its tracked posts.
+- Profanity and adult-content checks are keyword-based. They do not reliably detect explicit images/videos; a real visual moderation service would be needed for that.
+- Cleanup only deletes tracked bot-created posts. Telegram permissions and API restrictions apply; this tool does not erase all channel history.
+- Test in a private test group/channel before production. Features are code-added but have not been live-tested against your FadeHost deployment or your actual Telegram channels.
 
-   ```bash
-   python -m venv .venv
-   # Windows: .venv\\Scripts\\activate
-   # macOS/Linux:
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   python main.py
-   ```
+## Deploy
+1. Upload these files to your private GitHub repo or hosting project.
+2. Configure the environment variables in `.env` / hosting environment. Never commit your real token.
+3. Install dependencies from `requirements.txt` and run `python main.py`.
+4. Configure `OWNER_ID`, `OFFICIAL_CHANNEL`, `OFFICIAL_CHANNEL_URL`, and optionally `FEEDBACK_CHANNEL`.
+5. Keep `data/` on persistent storage. A server-local backup alone will be lost if the host deletes its disk; download the backup to your device or secure storage.
 
-6. Open your bot in Telegram and send `/start`. Use `/id` to find your numeric ID; set it in `.env` and restart.
-
-## Owner commands
-- `/admin` — open Telegram-only owner panel
-- `/id` — show your numeric Telegram ID
-- `/users` — user and content counts
-- `/addupdate Title | https://download-url | optional description`
-- `/delupdate UPDATE_ID` — hide update
-- `/addbutton Button title | https://example.com`
-- `/delbutton BUTTON_ID` — hide URL button
-- `/set welcome | Welcome message`
-- `/set youtube_url | https://youtube.com/@yourchannel`
-- `/set instagram_url | https://instagram.com/yourprofile`
-- `/set official_channel_url | https://t.me/yourchannel`
-- `/set support_url | https://t.me/support`
-- `/backup` — create and send database backup
-- `/restorehelp` — safe manual restore instructions
-- `/logs` — recent admin logs
-
-## Manual broadcast (channel post, text, photo, video, document)
-1. In the bot's private chat, send or forward/copy the post/media you want to broadcast.
-2. Reply to that message with `/broadcast`.
-3. Confirm the target and delivery report in chat. The target list is users who have started the bot.
-
-Note: the broadcast handler uses Telegram's copy-message operation. Protected content may not be copyable. For channel posts, you can copy/forward the desired post into the bot's private chat first.
-
-## Backups: where they live
-- Server local path: `backups/bot-backup-YYYYMMDD-HHMMSS.sqlite3`
-- Main live database: `data/bot.sqlite3`
-- Manual and scheduled backups are also sent as a document to the owner Telegram chat.
-- The latest 10 scheduled/local backup files are retained by the automatic routine.
-- Keep a copy outside the hosting server (for example, download the file to your own phone/computer or private storage). A backup stored only on the same server will not protect against server loss.
-- On hosting, ensure `data/` and `backups/` are on persistent storage. Ephemeral container filesystems may be erased on redeploy/restart.
-- `.env` contains secrets and is deliberately excluded from Git.
-
-## GitHub / deployment
-Push source files to a private GitHub repository. Do not commit `.env` or a bot token.
-The Dockerfile is included, but hosting requirements vary. A host must support a persistent Python process or Docker container and persistent storage. GitHub itself does not run a long-lived bot. Configure a deployment process on your host; do not assume a push automatically deploys unless the host integration is set up.
-
-## Before production
-This is a starter codebase, not a claim of production certification. Test with your own bot/channel, verify backup restore, set a private repository, protect the token, and review hosting-specific persistence/restart behavior before inviting a large audience.
+## Backup migration steps
+1. On old server, send `/backup` to the bot and download the `.sqlite3` file it returns.
+2. Deploy the updated bot using the same token and owner ID.
+3. Send the backup file to the bot in private chat with caption `/restore`.
+4. Confirm restore success. Then test `/admin`, `/start`, and a small broadcast test.

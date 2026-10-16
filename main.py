@@ -85,6 +85,19 @@ def init_db():
           source_chat TEXT, source_message_id INTEGER, total INTEGER DEFAULT 0,
           sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, status TEXT DEFAULT 'created'
         );
+        CREATE TABLE IF NOT EXISTS moderation(
+          chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, warnings INTEGER DEFAULT 0,
+          last_violation TEXT DEFAULT '', ban_until TEXT DEFAULT '', permanent INTEGER DEFAULT 0,
+          PRIMARY KEY(chat_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS channel_posts(
+          chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+          kind TEXT DEFAULT 'bot', PRIMARY KEY(chat_id,message_id)
+        );
+        CREATE TABLE IF NOT EXISTS support_tickets(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
+          status TEXT DEFAULT 'pending', created_at TEXT NOT NULL, reply TEXT DEFAULT ''
+        );
         """)
         defaults = {
             "welcome": f"👋 <b>{BOT_TITLE}</b> me aapka swagat hai!\n\nNeeche diye gaye menu se chunav karein:",
@@ -95,6 +108,17 @@ def init_db():
             "youtube_url": os.getenv("YOUTUBE_URL", "").strip(),
             "instagram_url": os.getenv("INSTAGRAM_URL", "").strip(),
             "support_url": os.getenv("SUPPORT_URL", "").strip(),
+            "feedback_channel": os.getenv("FEEDBACK_CHANNEL", "").strip(),
+            "group_welcome": "👋 Welcome {name}! Please read the group rules and be respectful.",
+            "anti_link": "1",
+            "profanity_filter": "1",
+            "adult_keyword_filter": "1",
+            "allowed_links": "t.me/",
+            "profanity_words": "", 
+            "adult_keywords": "porn,xxx,onlyfans,explicit,nude",
+            "warning_1_text": "⚠️ First warning: please follow the group rules.",
+            "ban_day2": "1",
+            "ban_day3": "7",
         }
         for key, val in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, val))
@@ -209,6 +233,9 @@ def admin_dashboard_kb():
          InlineKeyboardButton(text="💾 Backup", callback_data="admin:backup")],
         [InlineKeyboardButton(text="🛠 Maintenance Mode", callback_data="admin:maintenance")],
         [InlineKeyboardButton(text="📜 Admin Logs", callback_data="admin:logs")],
+        [InlineKeyboardButton(text="🛡️ Moderation Settings", callback_data="admin:moderation")],
+        [InlineKeyboardButton(text="🖼️ Feedback Album Help", callback_data="admin:feedback")],
+        [InlineKeyboardButton(text="🧹 Channel Cleanup Help", callback_data="admin:cleanup")],
         [InlineKeyboardButton(text="🏠 User Main Menu", callback_data="home")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -594,11 +621,373 @@ async def admin_callbacks(call: CallbackQuery, bot: Bot):
         new = "0" if setting("maintenance", "0") == "1" else "1"
         set_setting("maintenance", new)
         await call.message.answer(f"🛠 Maintenance mode: <b>{'ON (Active)' if new == '1' else 'OFF (Inactive)'}</b>")
+    elif action == "moderation":
+        await call.message.answer("🛡️ <b>Moderation</b>\n\n/modsettings — status\n/antilink_on or /antilink_off\n/profanity_on or /profanity_off\n/adultfilter_on or /adultfilter_off\n/setprofanity word1,word2\n/setallowedlinks t.me/,example.com\n\nPolicy: first violation warning; second 1-day ban; third 7-day ban; next violation permanent ban. Bot must have delete messages and ban users permissions in the group.")
+    elif action == "feedback":
+        await call.message.answer("🖼️ <b>Feedback Album</b>\n1) /setfeedbackchannel @YourChannel\n2) /feedback_album\n3) Send up to 10 photos\n4) /feedback_done\n5) Send caption; bot posts album to configured channel. Bot must be channel admin.")
+    elif action == "cleanup":
+        await call.message.answer("🧹 <b>Channel Cleanup</b>\n/cleanup_posts @YourChannel — deletes only bot-created feedback albums tracked in this database. It does not attempt to erase the whole channel history.")
     elif action == "logs":
         with connect() as c:
             rows = c.execute("SELECT at,action,detail FROM logs ORDER BY id DESC LIMIT 10").fetchall()
         body = "\n".join(f"• {r['at']} — {r['action']}: {r['detail']}" for r in rows) or "No logs."
         await call.message.answer("<b>Recent Logs:</b>\n" + body[:3500])
+
+# --- EXTENDED FEATURES: RESTORE, FEEDBACK ALBUM, GROUP MODERATION, WELCOME, SUPPORT ---
+feedback_sessions = {}  # owner_id -> list of (file_id, media_type)
+
+@dp.message(Command("restorehelp"))
+async def restore_help(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    await message.answer(
+        "♻️ <b>Database Restore</b>\n\n"
+        "1) Purane server se /backup se bani .sqlite3 file download karein.\n"
+        "2) Naye bot ke private chat me woh file document ke roop me bhejein aur caption me <code>/restore</code> likhein.\n"
+        "3) Bot file validate karke current database ko backup se replace karega.\n\n"
+        "⚠️ Restore se current database overwrite hota hai. Pehle /backup kar lena behtar hai."
+    )
+
+@dp.message(F.chat.type == "private", F.document, F.caption.startswith("/restore"))
+async def restore_database(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    doc = message.document
+    if not doc.file_name or not doc.file_name.lower().endswith((".sqlite3", ".sqlite", ".db")):
+        await message.answer("❌ SQLite backup file (.sqlite3/.sqlite/.db) bhejein, caption /restore rakhein.")
+        return
+    temp_path = BACKUP_DIR / f"restore-upload-{message.from_user.id}.sqlite3"
+    try:
+        await bot.download(doc, destination=temp_path)
+        src = sqlite3.connect(temp_path)
+        tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "users" not in tables or "settings" not in tables:
+            src.close()
+            temp_path.unlink(missing_ok=True)
+            await message.answer("❌ Ye is bot ka valid database backup nahi lag raha. Current database change nahi hua.")
+            return
+        # SQLite backup API replaces database contents safely while retaining the configured DB path.
+        dst = sqlite3.connect(DB_PATH)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        temp_path.unlink(missing_ok=True)
+        init_db()  # add any tables/settings introduced by this version
+        log_action("database_restore", f"file={doc.file_name}")
+        await message.answer("✅ Database restore ho gaya! Purane users, updates, buttons aur settings (backup me jo the) load ho gaye. Bot ko /start dobara karna zaroori nahi, lekin users ko DM sirf tab ja sakta hai jab unhone pehle bot start kiya ho aur bot ko block na kiya ho.")
+    except Exception as e:
+        log.exception("Database restore failed")
+        temp_path.unlink(missing_ok=True)
+        await message.answer(f"❌ Restore fail hua: {str(e)[:300]}")
+
+@dp.message(Command("setfeedbackchannel"))
+async def set_feedback_channel(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    value = message.text.partition(" ")[2].strip()
+    if not value:
+        await message.answer("Format: <code>/setfeedbackchannel @YourChannel</code>\nBot ko channel me admin banayein.")
+        return
+    set_setting("feedback_channel", value)
+    await message.answer(f"✅ Feedback album channel set: <code>{value}</code>")
+
+@dp.message(Command("feedback_album"))
+async def feedback_album_start(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    feedback_sessions[message.from_user.id] = []
+    await message.answer("🖼️ Feedback album mode ON. Ab 1 se 10 photos bhejein. Jab complete ho, /feedback_done bhejein. Cancel karne ke liye /feedback_cancel.")
+
+@dp.message(Command("feedback_cancel"))
+async def feedback_album_cancel(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    feedback_sessions.pop(message.from_user.id, None)
+    await message.answer("Feedback album cancel kar diya.")
+
+@dp.message(Command("feedback_done"))
+async def feedback_album_done(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    items = feedback_sessions.get(message.from_user.id)
+    if not items:
+        await message.answer("Pehle album mode me photos bhejein: /feedback_album")
+        return
+    await asyncio.sleep(1.2)  # allow Telegram media-group updates to arrive
+    items = feedback_sessions.pop(message.from_user.id, items)
+    # Re-read in case additional photos arrived during the short wait.
+    if not items:
+        await message.answer("Koi photo receive nahi hui.")
+        return
+    await message.answer(f"✅ {len(items)} photo(s) collect ho gayi. Ab album ka caption/description bhejein.")
+    feedback_sessions[message.from_user.id] = {"photos": items[:10], "awaiting_caption": True}
+
+@dp.message(F.chat.type == "private", F.photo)
+async def feedback_album_collect(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    session = feedback_sessions.get(message.from_user.id)
+    if isinstance(session, list):
+        if len(session) < 10:
+            session.append((message.photo[-1].file_id, "photo"))
+        else:
+            await message.answer("Maximum 10 photos allowed hain. /feedback_done bhejein.")
+
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def feedback_caption_handler(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    session = feedback_sessions.get(message.from_user.id)
+    if not isinstance(session, dict) or not session.get("awaiting_caption"):
+        return
+    photos = session.get("photos", [])
+    caption = message.text[:1024]
+    channel = setting("feedback_channel", "").strip()
+    if not channel:
+        feedback_sessions.pop(message.from_user.id, None)
+        await message.answer("❌ Feedback channel set nahi hai. Pehle /setfeedbackchannel @YourChannel karein; phir /feedback_album dobara karein.")
+        return
+    try:
+        from aiogram.types import InputMediaPhoto
+        media = []
+        for i, (file_id, _) in enumerate(photos[:10]):
+            media.append(InputMediaPhoto(media=file_id, caption=caption if i == 0 else None))
+        sent = await bot.send_media_group(chat_id=channel, media=media)
+        with connect() as c:
+            c.executemany("INSERT OR IGNORE INTO channel_posts(chat_id,message_id,created_at,kind) VALUES(?,?,?,?)",
+                          [(sent_msg.chat.id, sent_msg.message_id, now(), "feedback_album") for sent_msg in sent])
+        log_action("feedback_album_posted", f"channel={channel},photos={len(sent)}")
+        feedback_sessions.pop(message.from_user.id, None)
+        await message.answer(f"✅ Feedback album channel <code>{channel}</code> par post ho gaya ({len(sent)} photos).")
+    except Exception as e:
+        log.exception("Feedback album post failed")
+        await message.answer(f"❌ Album post nahi hua. Channel me bot admin hai aur channel ID/username sahi hai, check karein. Error: {str(e)[:250]}")
+
+@dp.message(Command("cleanup_posts"))
+async def cleanup_posts_cmd(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id):
+        return
+    args = message.text.partition(" ")[2].strip()
+    channel = args or setting("feedback_channel", "").strip() or setting("official_channel", OFFICIAL_CHANNEL).strip()
+    if not channel:
+        await message.answer("Format: <code>/cleanup_posts @YourChannel</code>")
+        return
+    with connect() as c:
+        rows = c.execute("SELECT message_id FROM channel_posts WHERE chat_id=(SELECT chat_id FROM channel_posts WHERE chat_id=? LIMIT 1) ORDER BY message_id DESC", (channel,)).fetchall()
+    # Channel usernames are not numeric chat ids in our tracked table; use exact resolved ID when possible.
+    try:
+        chat = await bot.get_chat(channel)
+        with connect() as c:
+            rows = c.execute("SELECT message_id FROM channel_posts WHERE chat_id=? ORDER BY message_id DESC", (chat.id,)).fetchall()
+        deleted = failed = 0
+        for row in rows:
+            try:
+                await bot.delete_message(chat_id=chat.id, message_id=row["message_id"])
+                deleted += 1
+            except Exception:
+                failed += 1
+            with connect() as c:
+                c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (chat.id, row["message_id"]))
+        log_action("cleanup_tracked_posts", f"channel={chat.id},deleted={deleted},failed={failed}")
+        await message.answer(f"🧹 Tracked bot posts cleanup complete. Deleted: {deleted}; failed: {failed}.\nNote: Ye sirf bot ke tracked posts delete karta hai, poora channel history nahi.")
+    except Exception as e:
+        await message.answer(f"❌ Channel access nahi hua: {str(e)[:250]}")
+
+@dp.message(Command("setwelcome"))
+async def set_group_welcome(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    value = message.text.partition(" ")[2].strip()
+    if not value:
+        await message.answer("Format: <code>/setwelcome Welcome {name}! Please read rules.</code>")
+        return
+    set_setting("group_welcome", value)
+    await message.answer("✅ Group welcome message update ho gaya. {name} ko member name se replace kiya jayega.")
+
+@dp.message(Command("modsettings"))
+async def mod_settings_cmd(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    await message.answer(
+        "🛡️ <b>Moderation Settings</b>\n"
+        f"Anti-link: {setting('anti_link','1')}\nProfanity filter: {setting('profanity_filter','1')}\nAdult keyword filter: {setting('adult_keyword_filter','1')}\n\n"
+        "Toggle commands: /antilink_on, /antilink_off, /profanity_on, /profanity_off, /adultfilter_on, /adultfilter_off\n"
+        "Custom profanity words: /setprofanity word1,word2\nAllowed link fragments: /setallowedlinks t.me/,example.com"
+    )
+
+async def set_toggle(message: Message, key: str, value: str):
+    if is_owner(message.from_user.id):
+        set_setting(key, value)
+        await message.answer(f"✅ {key} = {value}")
+
+@dp.message(Command("antilink_on"))
+async def antilink_on(message: Message): await set_toggle(message, "anti_link", "1")
+@dp.message(Command("antilink_off"))
+async def antilink_off(message: Message): await set_toggle(message, "anti_link", "0")
+@dp.message(Command("profanity_on"))
+async def profanity_on(message: Message): await set_toggle(message, "profanity_filter", "1")
+@dp.message(Command("profanity_off"))
+async def profanity_off(message: Message): await set_toggle(message, "profanity_filter", "0")
+@dp.message(Command("adultfilter_on"))
+async def adultfilter_on(message: Message): await set_toggle(message, "adult_keyword_filter", "1")
+@dp.message(Command("adultfilter_off"))
+async def adultfilter_off(message: Message): await set_toggle(message, "adult_keyword_filter", "0")
+
+@dp.message(Command("setprofanity"))
+async def set_profanity(message: Message):
+    if not is_owner(message.from_user.id): return
+    words = message.text.partition(" ")[2].strip()
+    set_setting("profanity_words", words)
+    await message.answer("✅ Custom profanity word list save ho gayi. Comma-separated words use karein.")
+
+@dp.message(Command("setallowedlinks"))
+async def set_allowed_links(message: Message):
+    if not is_owner(message.from_user.id): return
+    value = message.text.partition(" ")[2].strip()
+    set_setting("allowed_links", value)
+    await message.answer("✅ Allowed link fragments save ho gaye.")
+
+@dp.message(Command("warnings"))
+async def warnings_cmd(message: Message):
+    target = message.reply_to_message.from_user if message.reply_to_message else None
+    if not target:
+        await message.answer("Apne warning count ke liye /warnings, ya kisi user ke message par reply karke /warnings karein.")
+        target = message.from_user
+    with connect() as c:
+        row = c.execute("SELECT warnings,ban_until,permanent FROM moderation WHERE chat_id=? AND user_id=?", (message.chat.id, target.id)).fetchone()
+    if not row:
+        await message.answer(f"ℹ️ {target.full_name}: abhi koi warning record nahi hai.")
+    else:
+        state = "Permanent ban" if row["permanent"] else (f"Ban until {row['ban_until']}" if row["ban_until"] else "No active ban")
+        await message.answer(f"⚠️ {target.full_name}\nWarnings/violations: {row['warnings']}\nStatus: {state}")
+
+@dp.message(Command("resetwarnings"))
+async def reset_warnings_cmd(message: Message):
+    if not is_owner(message.from_user.id) and message.chat.type == "private": return
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("Group me user ke message par reply karke /resetwarnings karein.")
+        return
+    if not message.reply_to_message:
+        await message.answer("Jis user ki warnings reset karni hain, uske message par reply karein.")
+        return
+    target = message.reply_to_message.from_user
+    member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+    if not is_owner(message.from_user.id) and member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        return
+    with connect() as c:
+        c.execute("DELETE FROM moderation WHERE chat_id=? AND user_id=?", (message.chat.id, target.id))
+    log_action("reset_warnings", f"chat={message.chat.id},user={target.id}")
+    await message.answer(f"✅ {target.full_name} ki warning history reset ho gayi.")
+
+@dp.message(F.new_chat_members)
+async def group_welcome_handler(message: Message):
+    template = setting("group_welcome", "👋 Welcome {name}! Please read the group rules.")
+    for member in message.new_chat_members:
+        try:
+            await message.answer(template.replace("{name}", member.full_name[:100]))
+        except Exception:
+            pass
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+async def group_moderation_handler(message: Message, bot: Bot):
+    if not message.from_user or message.from_user.is_bot or not message.text:
+        return
+    # Exempt owner and current chat admins.
+    if is_owner(message.from_user.id): return
+    try:
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR): return
+    except Exception:
+        pass
+    text_l = message.text.lower()
+    reason = None
+    if setting("anti_link", "1") == "1":
+        import re
+        allowed = [x.strip().lower() for x in setting("allowed_links", "t.me/").split(",") if x.strip()]
+        has_link = bool(re.search(r"(https?://|www\.|t\.me/|telegram\.me/|[a-z0-9-]+\.(com|net|org|io|in|xyz)\b)", text_l))
+        if has_link and not any(x in text_l for x in allowed):
+            reason = "unauthorized link"
+    if not reason and setting("profanity_filter", "1") == "1":
+        words = [x.strip().lower() for x in setting("profanity_words", "").split(",") if x.strip()]
+        if words and any(w in text_l for w in words): reason = "profanity"
+    if not reason and setting("adult_keyword_filter", "1") == "1":
+        words = [x.strip().lower() for x in setting("adult_keywords", "porn,xxx,onlyfans,explicit,nude").split(",") if x.strip()]
+        if any(w in text_l for w in words): reason = "adult-content keyword"
+    if not reason: return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    with connect() as c:
+        row = c.execute("SELECT warnings,permanent FROM moderation WHERE chat_id=? AND user_id=?", (message.chat.id, message.from_user.id)).fetchone()
+        count = (row["warnings"] if row else 0) + 1
+        if row and row["permanent"]:
+            await bot.ban_chat_member(message.chat.id, message.from_user.id)
+            return
+        if count == 1:
+            c.execute("INSERT INTO moderation(chat_id,user_id,warnings,last_violation,ban_until,permanent) VALUES(?,?,?,?,?,0) ON CONFLICT(chat_id,user_id) DO UPDATE SET warnings=excluded.warnings,last_violation=excluded.last_violation,ban_until='',permanent=0", (message.chat.id, message.from_user.id, count, now(), ""))
+        elif count == 2:
+            until = datetime.now(timezone.utc).timestamp() + 86400
+            c.execute("INSERT INTO moderation(chat_id,user_id,warnings,last_violation,ban_until,permanent) VALUES(?,?,?,?,?,0) ON CONFLICT(chat_id,user_id) DO UPDATE SET warnings=excluded.warnings,last_violation=excluded.last_violation,ban_until=excluded.ban_until,permanent=0", (message.chat.id, message.from_user.id, count, now(), datetime.fromtimestamp(until, timezone.utc).isoformat(timespec="seconds")))
+        elif count == 3:
+            until = datetime.now(timezone.utc).timestamp() + 7*86400
+            c.execute("INSERT INTO moderation(chat_id,user_id,warnings,last_violation,ban_until,permanent) VALUES(?,?,?,?,?,0) ON CONFLICT(chat_id,user_id) DO UPDATE SET warnings=excluded.warnings,last_violation=excluded.last_violation,ban_until=excluded.ban_until,permanent=0", (message.chat.id, message.from_user.id, count, now(), datetime.fromtimestamp(until, timezone.utc).isoformat(timespec="seconds")))
+        else:
+            c.execute("INSERT INTO moderation(chat_id,user_id,warnings,last_violation,ban_until,permanent) VALUES(?,?,?,?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET warnings=excluded.warnings,last_violation=excluded.last_violation,ban_until='',permanent=1", (message.chat.id, message.from_user.id, count, now(), ""))
+    try:
+        if count == 1:
+            await message.answer(f"⚠️ {message.from_user.full_name}, warning 1/4: {reason}. Please follow the rules.")
+        elif count == 2:
+            await bot.ban_chat_member(message.chat.id, message.from_user.id, until_date=int(datetime.now(timezone.utc).timestamp())+86400)
+            await message.answer(f"🔨 {message.from_user.full_name}: second violation ({reason}). 1-day ban applied.")
+        elif count == 3:
+            await bot.ban_chat_member(message.chat.id, message.from_user.id, until_date=int(datetime.now(timezone.utc).timestamp())+7*86400)
+            await message.answer(f"🔨 {message.from_user.full_name}: third violation ({reason}). 7-day ban applied.")
+        else:
+            await bot.ban_chat_member(message.chat.id, message.from_user.id)
+            await message.answer(f"🚫 {message.from_user.full_name}: repeated violation after 7-day ban. Permanent ban applied. Contact admins to appeal.")
+        log_action("moderation_action", f"chat={message.chat.id},user={message.from_user.id},count={count},reason={reason}")
+    except Exception as e:
+        log.warning("Moderation action failed: %s", e)
+
+@dp.message(Command("support"))
+async def support_command(message: Message):
+    await message.answer("🆘 Apni support request bhejne ke liye /ticket aapka_message likhein.")
+
+@dp.message(Command("ticket"))
+async def ticket_command(message: Message):
+    body = message.text.partition(" ")[2].strip()
+    if not body:
+        await message.answer("Format: <code>/ticket Aapki problem ka detail</code>")
+        return
+    with connect() as c:
+        cur = c.execute("INSERT INTO support_tickets(user_id,text,created_at) VALUES(?,?,?)", (message.from_user.id, body[:3000], now()))
+        ticket_id = cur.lastrowid
+    log_action("support_ticket", f"id={ticket_id},user={message.from_user.id}")
+    await message.answer(f"✅ Support ticket #{ticket_id} create ho gaya. Admin review karega.")
+    if OWNER_ID:
+        try: await message.bot.send_message(OWNER_ID, f"🆘 <b>Support ticket #{ticket_id}</b>\nFrom: <code>{message.from_user.id}</code>\n{body[:3000]}\nReply: <code>/ticketreply {ticket_id} your reply</code>")
+        except Exception: pass
+
+@dp.message(Command("ticketreply"))
+async def ticket_reply_command(message: Message, bot: Bot):
+    if not is_owner(message.from_user.id): return
+    parts = message.text.partition(" ")[2].split(maxsplit=1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        await message.answer("Format: <code>/ticketreply TICKET_ID your reply</code>")
+        return
+    ticket_id, reply = int(parts[0]), parts[1]
+    with connect() as c:
+        row = c.execute("SELECT user_id FROM support_tickets WHERE id=?", (ticket_id,)).fetchone()
+        if row: c.execute("UPDATE support_tickets SET status='resolved',reply=? WHERE id=?", (reply[:3000], ticket_id))
+    if not row:
+        await message.answer("Ticket nahi mila.")
+        return
+    try: await bot.send_message(row["user_id"], f"🆘 <b>Support reply — ticket #{ticket_id}</b>\n{reply[:3000]}")
+    except Exception: await message.answer("Reply save ho gaya, lekin user ko DM deliver nahi hua.")
+    else: await message.answer("✅ Reply user ko bhej diya gaya.")
 
 async def main():
     init_db()
@@ -609,6 +998,8 @@ async def main():
             BotCommand(command="admin", description="Owner Admin Panel"),
             BotCommand(command="help", description="Help & Usage"),
             BotCommand(command="id", description="Show Telegram ID"),
+            BotCommand(command="ticket", description="Contact support"),
+            BotCommand(command="warnings", description="Check warning history"),
         ])
         asyncio.create_task(backup_loop(bot))
         log.info("Bot started successfully. Owner ID: %s", OWNER_ID)
